@@ -37,8 +37,7 @@ class RedisStore extends Store {
     this.client = redis.createClient(config);
     this.client.on('error', (err) => console.log('Redis Client Error', err));
     this.client.connect()
-
-
+    this.txAttempts = config.txAttempts || 1;
   }
 
   /**
@@ -50,22 +49,36 @@ class RedisStore extends Store {
    */
   async _hit(key, options, weight) {
 
-    let [counter, dateEnd] = await this.client.multi().get(key).ttl(key).exec();
+    let [counter, dateEnd] = [weight, Date.now() + options.interval];
+
+    for (let attempts=0; attempts < this.txAttempts; attempts++ ){
+      await this.client.watch(key);
+      try{
+        counter = await this.client.get(key);
+        dateEnd =  await this.client.ttl(key);
+      } catch (err) {
+        console.log(err);
+      }
     
-    if(counter === null) {
-      counter = weight;
-      dateEnd = Date.now() + options.interval;
-
       const seconds = Math.ceil(options.interval / 1000);
-      await this.client.setEx(key, seconds.toString(), counter.toString());
-    } else if (dateEnd === -2 || dateEnd === -1) {
-      counter = counter + weight;
-      dateEnd = Date.now() + options.interval;
-
-      const seconds = Math.ceil(options.interval / 1000);
-      await this.client.setEx(key, seconds.toString(), counter.toString());
-    } else {
-      counter = await this.client.incrBy(key, weight);
+      if(counter === null || dateEnd === -2 || dateEnd === -1) {
+        if ((dateEnd === -2 || dateEnd === -1)){
+          counter = counter + weight;
+        }
+        try{
+          await this.client.multi().setEx(key, seconds.toString(), counter.toString()).exec();
+          break; //ends loop in case of success 
+        } catch (err) {
+          console.log(err);
+        }
+      } else {
+        try{
+          counter = await this.client.multi().incrBy(key, weight).exec();
+          break; //ends loop in case of success
+        } catch (err) {
+          console.log(err);
+        }
+      }
     }
 
     return {
